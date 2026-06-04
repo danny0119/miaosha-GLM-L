@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="UTF-8" /></head>
+  <body>
+    <script>
+    try { typeof caches; } catch(e) {
+      Object.defineProperty(self, 'caches', {
+        value: {
+          open: function() { return Promise.reject(new Error('caches disabled')); },
+          keys: function() { return Promise.resolve([]); },
+          has: function() { return Promise.resolve(false); },
+          delete: function() { return Promise.resolve(false); },
+          match: function() { return Promise.resolve(undefined); },
+        },
+        writable: false, configurable: false,
+      });
+    }
+    </script>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

@@ -9,12 +9,13 @@
 
 import '@testing-library/jest-dom/vitest';
 import { fakeBrowser } from 'wxt/testing/fake-browser';
-import { beforeEach } from 'vitest';
+import { beforeEach, vi } from 'vitest';
+
+vi.mock('@xenova/transformers', () => ({
+  pipeline: vi.fn().mockResolvedValue(vi.fn()),
+  env: { backends: { onnx: { wasm: { wasmPaths: '' } } } },
+}));
 
 beforeEach(() => {
-  /**
-   * Reset all in-memory browser state (storage, tabs, alarms, …).
-   * See: https://webext-core.aklinker1.io/fake-browser/reseting-state
-   */
   fakeBrowser.reset();
 });

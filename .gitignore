@@ -4,6 +4,12 @@ node_modules
 .wxt
 .output
 output
+version
 .DS_Store
 reference-for-delete
 .tmp
+public/wasm/
+dist/
+_internal/
+*.exe
+*.zip

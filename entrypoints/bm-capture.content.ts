@@ -2,10 +2,12 @@
 // Injects MAIN world XHR interceptor and relays payment/ticket data to WXT storage
 // Also implements R3: Tab Audio+Visual reminder when user is on bigmodel.cn
 import { storage } from '#imports';
-import { buildAutoFirePlan, type AutoFirePlanShot } from '../lib/api/fire-plan';
+import { buildAutoFirePlan } from '../lib/api/fire-plan';
 import { calibrate } from '../lib/api/runtime-calibration';
 import { SALE_ALARM_MINUTES, getNextSaleTime, saleTimeStore, type SaleTimeConfig } from '../lib/settings/sale-time';
 import { captchaStore } from '../lib/settings/captcha';
+import { replenishStore } from '../lib/settings/replenish';
+import { FireConductor, type FireShot } from '../lib/api/fire-conductor';
 
 const TICKET_KEY = 'local:ticketPool';
 const AUTH_KEY = 'local:authHeaders';
@@ -244,6 +246,30 @@ export default defineContentScript({
     script.src = chrome.runtime.getURL('/bm-main.js');
     script.onload = () => script.remove();
     (document.head || document.documentElement).appendChild(script);
+
+    // ── Sandbox iframe for TrOCR model ──
+    let sandboxIframe: HTMLIFrameElement | null = null;
+    const sandboxPending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
+    function initSandboxIframe() {
+      sandboxIframe = document.createElement('iframe');
+      sandboxIframe.src = chrome.runtime.getURL('ocr-sandbox.html');
+      sandboxIframe.style.display = 'none';
+      sandboxIframe.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups allow-modals');
+      sandboxIframe.onload = () => {
+        const wasmUrl = chrome.runtime.getURL('wasm/');
+        sandboxIframe!.contentWindow?.postMessage(
+          { target: 'ocr-sandbox', type: 'init', wasmPaths: wasmUrl },
+          '*'
+        );
+      };
+      document.body.appendChild(sandboxIframe);
+    }
+    initSandboxIframe();
+    // ── End sandbox iframe ──
+
+
+
+
 
     // ── Safe storage wrapper ──
     async function safeGet<T>(key: string): Promise<T | null> {
@@ -542,6 +568,15 @@ export default defineContentScript({
     }
     // ── End SoldOut Watcher ───────────────────────────────────────────────────
 
+    // ── Auto-Replenish bridge: push config to MAIN world ──
+
+    async function pushReplenishConfigToMain() {
+      try {
+        const replCfg = await replenishStore.get();
+        postToOverlay({ type: 'REPLENISH_CONFIG', data: { enabled: replCfg.enabled, targetCount: replCfg.targetCount } });
+      } catch {}
+    }
+
     // ── Batch Preview bridge: storage → MAIN world ──
     async function pushBatchPreviewToOverlay() {
       const cached = await safeGet<any>(BATCH_PREVIEW_KEY);
@@ -583,6 +618,10 @@ export default defineContentScript({
           postToOverlay({ type: 'CAPTCHA_CONFIG', data: { batchSessionLimit: cfg.batchSessionLimit } });
         }
       }
+      // Push replenish config to MAIN world when changed
+      if (area === 'local' && changes['local:replenishConfig']) {
+        void pushReplenishConfigToMain();
+      }
     });
 
     // ── Helper: get valid ticket count + oldest TTL ──
@@ -610,82 +649,6 @@ export default defineContentScript({
       if (reservedTickets.length === 0) return pool;
       const reservedKeys = new Set(reservedTickets.map((ticket) => ticket.ticket + ':' + ticket.createdAt));
       return pool.filter((ticket) => !reservedKeys.has(ticket.ticket + ':' + ticket.createdAt));
-    }
-
-    function describeShot(shot: AutoFirePlanShot, idx: number, total: number) {
-      const waveTag = shot.wave === 'initial' ? 'initial' : 'follow-up';
-      return '>[#' + (idx + 1) + '/' + total + '][' + waveTag + '] ' + shot.productId.slice(-6);
-    }
-
-    function queueFireTimers(
-      shots: AutoFirePlanShot[],
-      authHeaders: any,
-      timers: ReturnType<typeof setTimeout>[],
-      state: { succeeded: boolean },
-    ) {
-      const total = shots.length;
-
-      const cancelAll = () => {
-        for (const id of timers) clearTimeout(id);
-      };
-
-      const fireOne = async (shot: AutoFirePlanShot, idx: number) => {
-        if (state.succeeded) return;
-        const t1 = Date.now();
-        try {
-          const res = await fetch('https://bigmodel.cn/api/biz/pay/preview', {
-            method: 'POST',
-            credentials: 'include',
-            headers: {
-              'content-type': 'application/json;charset=UTF-8',
-              'authorization': authHeaders.authorization,
-              'bigmodel-organization': authHeaders.bigmodelOrganization,
-              'bigmodel-project': authHeaders.bigmodelProject,
-            },
-            body: JSON.stringify({ productId: shot.productId, ticket: shot.ticket, randstr: shot.randstr }),
-          });
-          const body = await res.json();
-          const rtt = Date.now() - t1;
-          const tag = describeShot(shot, idx, total);
-
-          if (body.code === 200 && body.data && !body.data.soldOut && body.data.bizId) {
-            state.succeeded = true;
-            cancelAll();
-            postToOverlay({ type: 'FIRE_RESULT', line: tag + ': ORDER bizId=' + body.data.bizId + ' (' + rtt + 'ms)' });
-            postToOverlay({ type: 'FIRE_SHOT_RESULT', data: { shotIdx: idx, productId: shot.productId, wave: shot.wave, outcome: 'success', code: 200, rtt, bizId: body.data.bizId } });
-            const ps = {
-              bizId: body.data.bizId as string,
-              amount: (body.data.thirdPartyAmount ?? body.data.payAmount) as number,
-              productId: (body.data.productId ?? shot.productId) as string,
-              status: 'pending' as const,
-              updatedAt: Date.now(),
-            };
-            await safeSet('local:paymentState', ps);
-            postToOverlay({ type: 'BURST_FIRE_SUCCESS', data: ps });
-          } else if (body.code === 200 && body.data?.soldOut) {
-            postToOverlay({ type: 'FIRE_RESULT', line: tag + ': sold-out today (' + rtt + 'ms)' });
-            postToOverlay({ type: 'FIRE_SHOT_RESULT', data: { shotIdx: idx, productId: shot.productId, wave: shot.wave, outcome: 'soldout', code: 200, rtt } });
-          } else if (body.code === 555) {
-            postToOverlay({ type: 'FIRE_RESULT', line: tag + ': server-busy-555 (' + rtt + 'ms)' });
-            postToOverlay({ type: 'FIRE_SHOT_RESULT', data: { shotIdx: idx, productId: shot.productId, wave: shot.wave, outcome: 'busy', code: 555, rtt } });
-          } else {
-            postToOverlay({ type: 'FIRE_RESULT', line: tag + ': code=' + body.code + ' ' + (body.msg || '') + ' (' + rtt + 'ms)' });
-            postToOverlay({ type: 'FIRE_SHOT_RESULT', data: { shotIdx: idx, productId: shot.productId, wave: shot.wave, outcome: 'error', code: body.code, rtt } });
-          }
-        } catch (e: any) {
-          postToOverlay({ type: 'FIRE_RESULT', line: describeShot(shot, idx, total) + ': net-err: ' + (e?.message || 'unknown') });
-          postToOverlay({ type: 'FIRE_SHOT_RESULT', data: { shotIdx: idx, productId: shot.productId, wave: shot.wave, outcome: 'neterr' } });
-        }
-      };
-
-      for (let i = 0; i < shots.length; i++) {
-        const shot = shots[i];
-        const idx = i;
-        const delay = Math.max(0, shot.scheduledAt - Date.now());
-        timers.push(setTimeout(() => { void fireOne(shot, idx); }, delay));
-      }
-
-      return cancelAll;
     }
 
     async function runAutoFirePlan(startMs: number, authHeaders: any) {
@@ -719,34 +682,94 @@ export default defineContentScript({
         });
       }
 
+      const totalShots = allShots.length;
+      const initialCount = plan.initialShots.length;
       postToOverlay({
         type: 'FIRE_RESULT',
-        line: '> Auto plan: initial ' + plan.initialShots.length + ' concurrent + follow-up ' + plan.followUpShots.length + ' randomized expiry-safe shots',
+        line: '> Auto plan: ' + initialCount + ' initial concurrent + ' + plan.followUpShots.length + ' adaptive follow-up shots',
       });
 
       postToOverlay({
         type: 'FIRE_BATCH_START',
         data: {
           queue: allShots.map((shot, idx) => ({ shotIdx: idx, productId: shot.productId, wave: shot.wave, scheduledAt: shot.scheduledAt })),
-          totalShots: allShots.length,
+          totalShots,
           startMs,
-          initialCount: plan.initialShots.length,
+          initialCount,
           followUpCount: plan.followUpShots.length,
         },
       });
 
-      const timers: ReturnType<typeof setTimeout>[] = [];
-      const state = { succeeded: false };
-      const cancelAll = queueFireTimers(allShots, authHeaders, timers, state);
-      const lastScheduledAt = allShots.reduce((latest, shot) => Math.max(latest, shot.scheduledAt), startMs);
+      const shots: FireShot[] = allShots.map((s) => ({
+        ticket: s.ticket,
+        randstr: s.randstr,
+        productId: s.productId,
+        wave: s.wave,
+        scheduledAt: s.scheduledAt,
+      }));
 
-      timers.push(setTimeout(() => {
-        if (!state.succeeded) {
-          cancelAll();
-          postToOverlay({ type: 'FIRE_RESULT', line: '> Auto plan complete — ammo depleted (' + allShots.length + ' shots)' });
-          postToOverlay({ type: 'BURST_FIRE_DEPLETED', data: { total: allShots.length } });
-        }
-      }, Math.max(0, lastScheduledAt - Date.now()) + 1000));
+      const conductor = new FireConductor(
+        shots,
+        async (shot, shotIdx) => {
+          const t1 = Date.now();
+          const tag = '>[#' + (shotIdx + 1) + '/' + totalShots + '][' + (shot.wave || 'burst') + '] ' + shot.productId.slice(-6);
+          try {
+            const res = await fetch('https://bigmodel.cn/api/biz/pay/preview', {
+              method: 'POST',
+              credentials: 'include',
+              headers: {
+                'content-type': 'application/json;charset=UTF-8',
+                'authorization': authHeaders.authorization,
+                'bigmodel-organization': authHeaders.bigmodelOrganization,
+                'bigmodel-project': authHeaders.bigmodelProject,
+              },
+              body: JSON.stringify({ productId: shot.productId, ticket: shot.ticket, randstr: shot.randstr }),
+            });
+            const body = await res.json();
+            const rtt = Date.now() - t1;
+
+            if (body.code === 200 && body.data && !body.data.soldOut && body.data.bizId) {
+              postToOverlay({ type: 'FIRE_RESULT', line: tag + ': ORDER bizId=' + body.data.bizId + ' (' + rtt + 'ms)' });
+              return { shotIdx, productId: shot.productId, outcome: 'success' as const, code: 200, rtt, bizId: body.data.bizId, wave: shot.wave };
+            } else if (body.code === 200 && body.data?.soldOut) {
+              postToOverlay({ type: 'FIRE_RESULT', line: tag + ': sold-out today (' + rtt + 'ms)' });
+              return { shotIdx, productId: shot.productId, outcome: 'soldout' as const, code: 200, rtt, wave: shot.wave };
+            } else if (body.code === 555) {
+              postToOverlay({ type: 'FIRE_RESULT', line: tag + ': server-busy-555 (' + rtt + 'ms)' });
+              return { shotIdx, productId: shot.productId, outcome: 'busy' as const, code: 555, rtt, wave: shot.wave };
+            } else {
+              postToOverlay({ type: 'FIRE_RESULT', line: tag + ': code=' + body.code + ' ' + (body.msg || '') + ' (' + rtt + 'ms)' });
+              return { shotIdx, productId: shot.productId, outcome: 'error' as const, code: body.code, rtt, wave: shot.wave };
+            }
+          } catch (e: any) {
+            postToOverlay({ type: 'FIRE_RESULT', line: tag + ': net-err: ' + (e?.message || 'unknown') });
+            return { shotIdx, productId: shot.productId, outcome: 'neterr' as const, rtt: Math.round(Date.now() - t1), wave: shot.wave };
+          }
+        },
+        {
+          maxConcurrent: Math.max(initialCount, 3),
+          onShot: (result) => {
+            postToOverlay({ type: 'FIRE_SHOT_RESULT', data: result });
+          },
+          onSuccess: async (result) => {
+            const ps = {
+              bizId: result.bizId as string,
+              amount: 0,
+              productId: result.productId,
+              status: 'pending' as const,
+              updatedAt: Date.now(),
+            };
+            await safeSet('local:paymentState', ps);
+            postToOverlay({ type: 'BURST_FIRE_SUCCESS', data: ps });
+          },
+          onDepleted: () => {
+            postToOverlay({ type: 'FIRE_RESULT', line: '> Auto plan complete — ammo depleted (' + totalShots + ' shots)' });
+            postToOverlay({ type: 'BURST_FIRE_DEPLETED', data: { total: totalShots } });
+          },
+        },
+      );
+
+      conductor.start();
     }
 
     // ── Burst Fire: sequential 50ms-interval launching ──
@@ -792,91 +815,91 @@ export default defineContentScript({
       postToOverlay({ type: 'TICKET_COUNT', count: remainingInfo.count, ttl: remainingInfo.ttl });
       try { chrome.runtime.sendMessage({ type: 'TICKET_POOL_UPDATED', count: remainingInfo.count }); } catch {}
 
+      const totalShots = queue.length;
+
       postToOverlay({
         type: 'FIRE_RESULT',
-        line: '> Burst: ' + queue.length + ' requests @ 50ms intervals' + (remainingInfo.count > 0 ? ' (' + remainingInfo.count + ' tickets kept)' : ''),
+        line: '> Burst: ' + totalShots + ' requests (adaptive concurrency)' + (remainingInfo.count > 0 ? ' (' + remainingInfo.count + ' tickets kept)' : ''),
       });
 
-      // ── Notify fire-viz overlay: burst is starting (D+C visualization) ──
       postToOverlay({
         type: 'FIRE_BATCH_START',
         data: {
           queue: queue.map((item, idx) => ({ shotIdx: idx, productId: item.productId })),
-          totalShots: queue.length,
+          totalShots,
           startMs,
         },
       });
 
-      const timers: ReturnType<typeof setTimeout>[] = [];
-      let succeeded = false;
+      const shots: FireShot[] = queue.map((item) => ({
+        ticket: item.ticket,
+        randstr: item.randstr,
+        productId: item.productId,
+        wave: 'burst',
+      }));
 
-      const cancelAll = () => { for (const id of timers) clearTimeout(id); };
+      const conductor = new FireConductor(
+        shots,
+        async (shot, shotIdx) => {
+          const t1 = Date.now();
+          const tag = '>[#' + (shotIdx + 1) + '/' + totalShots + '] ' + shot.productId.slice(-6);
+          try {
+            const res = await fetch('https://bigmodel.cn/api/biz/pay/preview', {
+              method: 'POST',
+              credentials: 'include',
+              headers: {
+                'content-type': 'application/json;charset=UTF-8',
+                'authorization': authHeaders.authorization,
+                'bigmodel-organization': authHeaders.bigmodelOrganization,
+                'bigmodel-project': authHeaders.bigmodelProject,
+              },
+              body: JSON.stringify({ productId: shot.productId, ticket: shot.ticket, randstr: shot.randstr }),
+            });
+            const body = await res.json();
+            const rtt = Date.now() - t1;
 
-      const fireOne = async (item: { ticket: string; randstr: string; productId: string }, idx: number) => {
-        if (succeeded) return;
-        const t1 = Date.now();
-        try {
-          const res = await fetch('https://bigmodel.cn/api/biz/pay/preview', {
-            method: 'POST',
-            credentials: 'include',
-            headers: {
-              'content-type': 'application/json;charset=UTF-8',
-              'authorization': authHeaders.authorization,
-              'bigmodel-organization': authHeaders.bigmodelOrganization,
-              'bigmodel-project': authHeaders.bigmodelProject,
-            },
-            body: JSON.stringify({ productId: item.productId, ticket: item.ticket, randstr: item.randstr }),
-          });
-          const body = await res.json();
-          const rtt = Date.now() - t1;
-          const tag = '>[#' + (idx + 1) + '/' + queue.length + '] ' + item.productId.slice(-6);
-
-          if (body.code === 200 && body.data && !body.data.soldOut && body.data.bizId) {
-            // ── SUCCESS: valid bizId returned ──
-            succeeded = true;
-            cancelAll();
-            postToOverlay({ type: 'FIRE_RESULT', line: tag + ': ORDER bizId=' + body.data.bizId + ' (' + rtt + 'ms)' });
-            postToOverlay({ type: 'FIRE_SHOT_RESULT', data: { shotIdx: idx, productId: item.productId, outcome: 'success', code: 200, rtt, bizId: body.data.bizId } });
+            if (body.code === 200 && body.data && !body.data.soldOut && body.data.bizId) {
+              postToOverlay({ type: 'FIRE_RESULT', line: tag + ': ORDER bizId=' + body.data.bizId + ' (' + rtt + 'ms)' });
+              return { shotIdx, productId: shot.productId, outcome: 'success' as const, code: 200, rtt, bizId: body.data.bizId };
+            } else if (body.code === 200 && body.data?.soldOut) {
+              postToOverlay({ type: 'FIRE_RESULT', line: tag + ': sold-out today (' + rtt + 'ms)' });
+              return { shotIdx, productId: shot.productId, outcome: 'soldout' as const, code: 200, rtt };
+            } else if (body.code === 555) {
+              postToOverlay({ type: 'FIRE_RESULT', line: tag + ': server-busy-555 (' + rtt + 'ms)' });
+              return { shotIdx, productId: shot.productId, outcome: 'busy' as const, code: 555, rtt };
+            } else {
+              postToOverlay({ type: 'FIRE_RESULT', line: tag + ': code=' + body.code + ' ' + (body.msg || '') + ' (' + rtt + 'ms)' });
+              return { shotIdx, productId: shot.productId, outcome: 'error' as const, code: body.code, rtt };
+            }
+          } catch (e: any) {
+            postToOverlay({ type: 'FIRE_RESULT', line: tag + ': net-err: ' + (e?.message || 'unknown') });
+            return { shotIdx, productId: shot.productId, outcome: 'neterr' as const, rtt: Math.round(Date.now() - t1) };
+          }
+        },
+        {
+          maxConcurrent: 8,
+          onShot: (result) => {
+            postToOverlay({ type: 'FIRE_SHOT_RESULT', data: result });
+          },
+          onSuccess: async (result) => {
             const ps = {
-              bizId: body.data.bizId as string,
-              amount: (body.data.thirdPartyAmount ?? body.data.payAmount) as number,
-              productId: (body.data.productId ?? item.productId) as string,
+              bizId: result.bizId as string,
+              amount: 0,
+              productId: result.productId,
               status: 'pending' as const,
               updatedAt: Date.now(),
             };
             await safeSet('local:paymentState', ps);
             postToOverlay({ type: 'BURST_FIRE_SUCCESS', data: ps });
-          } else if (body.code === 200 && body.data?.soldOut) {
-            postToOverlay({ type: 'FIRE_RESULT', line: tag + ': sold-out today (' + rtt + 'ms)' });
-            postToOverlay({ type: 'FIRE_SHOT_RESULT', data: { shotIdx: idx, productId: item.productId, outcome: 'soldout', code: 200, rtt } });
-          } else if (body.code === 555) {
-            postToOverlay({ type: 'FIRE_RESULT', line: tag + ': server-busy-555 (' + rtt + 'ms)' });
-            postToOverlay({ type: 'FIRE_SHOT_RESULT', data: { shotIdx: idx, productId: item.productId, outcome: 'busy', code: 555, rtt } });
-          } else {
-            postToOverlay({ type: 'FIRE_RESULT', line: tag + ': code=' + body.code + ' ' + (body.msg || '') + ' (' + rtt + 'ms)' });
-            postToOverlay({ type: 'FIRE_SHOT_RESULT', data: { shotIdx: idx, productId: item.productId, outcome: 'error', code: body.code, rtt } });
-          }
-        } catch (e: any) {
-          postToOverlay({ type: 'FIRE_RESULT', line: '>[#' + (idx + 1) + '] net-err: ' + (e?.message || 'unknown') });
-          postToOverlay({ type: 'FIRE_SHOT_RESULT', data: { shotIdx: idx, productId: item.productId, outcome: 'neterr' } });
-        }
-      };
+          },
+          onDepleted: () => {
+            postToOverlay({ type: 'FIRE_RESULT', line: '> Burst complete — ammo depleted (' + totalShots + ' shots)' });
+            postToOverlay({ type: 'BURST_FIRE_DEPLETED', data: { total: totalShots } });
+          },
+        },
+      );
 
-      const INTERVAL_MS = 50;
-      const baseDelay = Math.max(0, startMs - Date.now());
-      for (let i = 0; i < queue.length; i++) {
-        const item = queue[i];
-        const idx = i;
-        timers.push(setTimeout(() => { fireOne(item, idx); }, baseDelay + idx * INTERVAL_MS));
-      }
-
-      // After last shot + 1s response window, report depletion if still no success
-      timers.push(setTimeout(() => {
-        if (!succeeded) {
-          postToOverlay({ type: 'FIRE_RESULT', line: '> Burst complete — ammo depleted (' + queue.length + ' shots)' });
-          postToOverlay({ type: 'BURST_FIRE_DEPLETED', data: { total: queue.length } });
-        }
-      }, baseDelay + (queue.length - 1) * INTERVAL_MS + 1000));
+      conductor.start();
     }
 
     async function prefireAndBurst(startMs: number, reason: string) {
@@ -916,8 +939,24 @@ export default defineContentScript({
       await burstFire(startMs, authStatus.headers);
     }
 
-    // ── Listen for messages from MAIN world script ──
+    // ── Listen for messages from MAIN world script + sandbox iframe ──
     window.addEventListener('message', async (event) => {
+      // Messages from sandbox iframe
+      if (event.data?.target === 'bm-capture') {
+        if (event.data.type === 'result') {
+          console.log('[capture] sandbox result received, msgId:', event.data.msgId, 'chars:', event.data.chars, 'error:', event.data.error);
+          const p = sandboxPending.get(event.data.msgId);
+          if (p) {
+            sandboxPending.delete(event.data.msgId);
+            if (event.data.error) p.reject(new Error(event.data.error));
+            else p.resolve({ chars: event.data.chars });
+          } else {
+            console.warn('[capture] no pending for msgId:', event.data.msgId);
+          }
+        }
+        return;
+      }
+
       if (event.source !== window) return;
 
       // From overlay (MAIN world) — commands
@@ -1003,6 +1042,40 @@ export default defineContentScript({
         }
       }
 
+      // ── Auto-replenish: captcha modal detected, start solving ──
+      if (type === 'AUTO_REPLENISH_MODAL_OPEN' && payload) {
+        const iframeRect = payload.iframeRect;
+        const promptChars: string[] | null = payload.promptChars;
+        if (iframeRect && promptChars && promptChars.length >= 3) {
+          const dpr = window.devicePixelRatio || 1;
+          console.log('[capture] SOLVE_CAPTCHA_REQUEST sending', { iframeRect, promptChars, dpr });
+          try {
+            const response = await chrome.runtime.sendMessage({
+              type: 'SOLVE_CAPTCHA_REQUEST',
+              iframeRect,
+              promptChars,
+              dpr,
+            });
+            console.log('[capture] SOLVE_CAPTCHA_RESPONSE', response);
+            if (response?.points?.length > 0) {
+              window.postMessage({
+                __miaosha_cmd: true,
+                type: 'CAPTCHA_CLICK',
+                data: { points: response.points },
+              }, '*');
+            } else {
+              const errMsg = response?.error || 'empty points';
+              console.error('[capture] solve failed:', errMsg);
+              postToOverlay({ type: 'FIRE_RESULT', line: '> Auto-replenish: solve failed: ' + errMsg });
+            }
+          } catch (e: any) {
+            console.error('[capture] solve error:', e);
+            postToOverlay({ type: 'FIRE_RESULT', line: '> Auto-replenish: solve error: ' + (e?.message || 'unknown') });
+            window.postMessage({ __miaosha_cmd: true, type: 'CAPTCHA_CLICK', data: { points: null } }, '*');
+          }
+        }
+      }
+
       // ── Payment preview intercepted ──
       if (type === 'PAYMENT_PREVIEW' && payload) {
         const status = payload.soldOut ? 'error' : (payload.bizId ? 'pending' : 'waiting');
@@ -1029,8 +1102,36 @@ export default defineContentScript({
       }
     });
 
-    // ── Listen for commands from popup ──
+
+
+    // ── Helper: receive RECOGNIZE_REQUEST from background, proxy to sandbox iframe ──
+    function receiveRecognizeRequest(msg: any, sendResponse: (r: any) => void) {
+      (async () => {
+        try {
+          sandboxIframe?.contentWindow?.postMessage(
+            { target: 'ocr-sandbox', type: 'recognize', msgId: msg.msgId, buffers: msg.buffers },
+            '*'
+          );
+          const result = await new Promise<any>((resolve, reject) => {
+            sandboxPending.set(msg.msgId, { resolve, reject });
+            setTimeout(() => {
+              const p = sandboxPending.get(msg.msgId);
+              if (p) { sandboxPending.delete(msg.msgId); reject(new Error('OCR timeout in sandbox')); }
+            }, 135000);
+          });
+          sendResponse({ chars: result.chars });
+        } catch (e: any) {
+          sendResponse({ error: e.message || String(e) });
+        }
+      })();
+    }
+
+    // ── Listen for commands from popup + background ──
     chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+      if (msg.target === 'bm-capture' && msg.type === 'RECOGNIZE_REQUEST') {
+        receiveRecognizeRequest(msg, sendResponse);
+        return true;
+      }
       if (msg.type === 'PRODUCE_CAPTCHA') {
         window.postMessage({ __miaosha_cmd: true, type: 'PRODUCE_CAPTCHA' }, '*');
         sendResponse({ ok: true });
@@ -1042,7 +1143,19 @@ export default defineContentScript({
       if (msg.type === 'OPEN_POPUP') {
         chrome.runtime.sendMessage({ type: 'OPEN_POPUP' });
       }
+      if (msg.type === 'START_REPLENISH') {
+        const targetCount = msg.targetCount || 30;
+        window.postMessage({ __miaosha_cmd: true, type: 'AUTO_REPLENISH', data: { targetCount } }, '*');
+        sendResponse({ ok: true });
+      }
+      if (msg.type === 'STOP_REPLENISH') {
+        window.postMessage({ __miaosha_cmd: true, type: 'STOP_REPLENISH' }, '*');
+        sendResponse({ ok: true });
+      }
     });
+
+    // Push replenish config immediately (independent from other sync)
+    setTimeout(() => void pushReplenishConfigToMain(), 100);
 
     // Initial overlay sync
     setTimeout(async () => {

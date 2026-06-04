@@ -12,6 +12,11 @@
     captchaStore,
     type CaptchaConfig,
   } from '../../lib/settings/captcha';
+  import {
+    REPLENISH_CONFIG_DEFAULT,
+    replenishStore,
+    type ReplenishConfig,
+  } from '../../lib/settings/replenish';
 
   let mode = $state<DevMode>('development');
   let loaded = $state(false);
@@ -31,6 +36,13 @@
   let captchaSaving = $state(false);
   let captchaSaveMessage = $state('');
 
+  let replenishEnabled = $state(REPLENISH_CONFIG_DEFAULT.enabled);
+  let replenishTarget = $state(REPLENISH_CONFIG_DEFAULT.targetCount);
+  let replenishLeadSec = $state(REPLENISH_CONFIG_DEFAULT.leadTimeSec);
+  let committedReplenish = $state<ReplenishConfig | null>(null);
+  let replenishSaving = $state(false);
+  let replenishSaveMessage = $state('');
+
   const TIMEZONES = [
     { value: 'Asia/Shanghai',    label: '🇨🇳 北京时间 (UTC+8)' },
     { value: 'Asia/Tokyo',       label: '🇯🇵 东京时间 (UTC+9)' },
@@ -41,13 +53,14 @@
     { value: 'Europe/Paris',     label: '🇫🇷 巴黎时间 (UTC+1)' },
   ];
 
-  $effect(() => {
+    $effect(() => {
     Promise.all([
       devEnvironment.get(),
       saleTimeStore.get(),
       saleTimeStore.getAlarmStatus(),
       captchaStore.get(),
-    ]).then(([m, s, status, captcha]) => {
+      replenishStore.get(),
+    ]).then(([m, s, status, captcha, replenish]) => {
       mode = m;
       saleHour = s.hour;
       saleMinute = s.minute;
@@ -58,6 +71,10 @@
       alarmStatus = status;
       batchSessionLimit = captcha.batchSessionLimit;
       committedCaptcha = { ...captcha };
+      replenishEnabled = replenish.enabled;
+      replenishTarget = replenish.targetCount;
+      replenishLeadSec = replenish.leadTimeSec;
+      committedReplenish = { ...replenish };
       loaded = true;
     });
   });
@@ -168,6 +185,42 @@
   async function handleCaptchaReset() {
     batchSessionLimit = CAPTCHA_CONFIG_DEFAULT.batchSessionLimit;
     await handleCaptchaConfirm();
+  }
+
+  function currentReplenishConfig(): ReplenishConfig {
+    return {
+      enabled: replenishEnabled,
+      targetCount: Math.max(1, Math.min(200, Number(replenishTarget) || REPLENISH_CONFIG_DEFAULT.targetCount)),
+      leadTimeSec: Math.max(60, Math.min(600, Number(replenishLeadSec) || REPLENISH_CONFIG_DEFAULT.leadTimeSec)),
+    };
+  }
+
+  function isReplenishDirty(): boolean {
+    if (!committedReplenish) return true;
+    const cur = currentReplenishConfig();
+    return cur.enabled !== committedReplenish.enabled
+      || cur.targetCount !== committedReplenish.targetCount
+      || cur.leadTimeSec !== committedReplenish.leadTimeSec;
+  }
+
+  async function handleReplenishConfirm() {
+    const config = currentReplenishConfig();
+    replenishSaving = true;
+    replenishSaveMessage = '';
+    try {
+      await replenishStore.set(config);
+      committedReplenish = { ...config };
+      replenishSaveMessage = `已生效：${config.enabled ? '已开启' : '已关闭'}，目标 ${config.targetCount} 子弹，提前 ${config.leadTimeSec}s`;
+    } finally {
+      replenishSaving = false;
+    }
+  }
+
+  async function handleReplenishReset() {
+    replenishEnabled = REPLENISH_CONFIG_DEFAULT.enabled;
+    replenishTarget = REPLENISH_CONFIG_DEFAULT.targetCount;
+    replenishLeadSec = REPLENISH_CONFIG_DEFAULT.leadTimeSec;
+    await handleReplenishConfirm();
   }
 </script>
 
@@ -367,6 +420,64 @@
       </div>
     {/if}
   </section>
+
+  <section class="section-card">
+    <div class="section-heading">
+      <span class="accent-bar" style="background: var(--indigo); box-shadow: 0 0 14px rgba(99,102,241,0.35);"></span>
+      <h3>&#127919; 自动补弹</h3>
+    </div>
+    <p class="section-note">抢购前自动补充验证码子弹。T-5min 子弹过期，建议提前 300s（5分钟）开始补弹。</p>
+
+    {#if loaded}
+      <div class="sale-time-form">
+        <div class="form-row">
+          <div class="form-group" style="flex: 0 0 auto;">
+            <label class="form-label" for="replenish-toggle">开启</label>
+            <label class="toggle-label">
+              <input id="replenish-toggle" type="checkbox" bind:checked={replenishEnabled} />
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="replenish-target">目标子弹数</label>
+            <input id="replenish-target" type="number" class="form-select form-input-num" min="1" max="200" step="1" bind:value={replenishTarget} disabled={!replenishEnabled} />
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="replenish-lead">提前秒数</label>
+            <input id="replenish-lead" type="number" class="form-select form-input-num" min="60" max="600" step="10" bind:value={replenishLeadSec} disabled={!replenishEnabled} />
+          </div>
+        </div>
+        <div class="next-sale-preview">
+          <span class="preview-label">当前设定</span>
+          <span class="preview-value">
+            <span class="highlight-val">{replenishEnabled ? '已开启' : '已关闭'}</span>
+            {#if replenishEnabled}
+              <span style="margin-left:8px;color:var(--text-muted);font-size:12px;">{replenishTarget} 弹 / 提前 {replenishLeadSec}s</span>
+            {/if}
+          </span>
+          {#if isReplenishDirty()}
+            <span class="dirty-pill">待确认</span>
+          {/if}
+        </div>
+
+        <div class="sale-time-actions">
+          {#if replenishSaveMessage}
+            <span class="save-message">{replenishSaveMessage}</span>
+          {/if}
+          <button class="btn-confirm" type="button" onclick={handleReplenishConfirm} disabled={replenishSaving || !isReplenishDirty()}>
+            {replenishSaving ? '保存中...' : '确定生效'}
+          </button>
+          <button class="btn-reset" type="button" onclick={handleReplenishReset}>
+            ↺ 重置默认 <span class="reset-hint">{REPLENISH_CONFIG_DEFAULT.enabled ? '开' : '关'} / {REPLENISH_CONFIG_DEFAULT.targetCount} 弹 / {REPLENISH_CONFIG_DEFAULT.leadTimeSec}s</span>
+          </button>
+        </div>
+      </div>
+    {:else}
+      <div class="loading-skeleton">
+        <div class="skeleton-row"></div>
+      </div>
+    {/if}
+  </section>
 </div>
 
 <style>
@@ -503,4 +614,17 @@
   @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
 
   @media (max-width: 960px) { .form-row, .sale-time-actions { flex-wrap: wrap; } }
+
+  .toggle-label { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; padding: 6px 0; }
+  .toggle-label input[type="checkbox"] { position: absolute; opacity: 0; pointer-events: none; }
+  .toggle-slider {
+    position: relative; width: 44px; height: 24px; border-radius: 999px; background: rgba(148,163,184,0.3);
+    transition: background 200ms; flex: 0 0 auto;
+  }
+  .toggle-slider::after {
+    content: ''; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%;
+    background: #fff; transition: transform 200ms; box-shadow: 0 2px 6px rgba(0,0,0,0.18);
+  }
+  .toggle-label input:checked + .toggle-slider { background: linear-gradient(135deg, #6366f1, #818cf8); }
+  .toggle-label input:checked + .toggle-slider::after { transform: translateX(20px); }
 </style>

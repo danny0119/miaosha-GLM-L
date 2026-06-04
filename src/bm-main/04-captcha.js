@@ -22,6 +22,13 @@ function produceCaptcha() {
     }, { mode: 'popup' });
     _activeCaptcha = c;
     c.show();
+    // If batch mode with replenish, auto-solve this captcha
+    if (_batchMode && _replenishEnabled) {
+      console.log('[miaosha] Auto-replenish: scheduling auto-solve');
+      setTimeout(autoSolveCurrentCaptcha, 1000);
+    } else {
+      console.log('[miaosha] Auto-replenish skipped: batchMode=' + _batchMode + ' replenishEnabled=' + _replenishEnabled);
+    }
   } catch(e) { postMsg('CAPTCHA_ERROR', { msg: e.message }); }
 }
 
@@ -34,7 +41,13 @@ function destroyActiveCaptcha() {
 
 function setBatchMode(on) {
   _batchMode = on;
-  if (on) _batchCount = 0;
+  if (on) {
+    _batchCount = 0;
+    // Override batch limit when auto-replenish is on
+    if (_replenishEnabled) {
+      BATCH_SESSION_LIMIT = _replenishTarget;
+    }
+  }
   var btn = document.getElementById('_ab');
   if (btn) {
     if (on) {
@@ -75,3 +88,13 @@ function setupCaptchaKeyboard() {
   }, true);
 }
 setupCaptchaKeyboard();
+
+// ── Listen for replenish config from ISOLATED world ──
+window.addEventListener('message', function(ev) {
+  if (ev.source !== window || !ev.data || !ev.data.__miaosha_overlay) return;
+  if (ev.data.type === 'REPLENISH_CONFIG' && ev.data.data) {
+    _replenishEnabled = !!ev.data.data.enabled;
+    _replenishTarget = ev.data.data.targetCount || 30;
+    console.log('[miaosha] REPLENISH_CONFIG received', _replenishEnabled, _replenishTarget);
+  }
+});

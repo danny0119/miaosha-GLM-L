@@ -8,6 +8,8 @@ import {
   getNextSaleTime,
   saleTimeStore,
 } from '../lib/settings/sale-time';
+import { recognizeChars as recognizeCharsTrOCR } from '../lib/vision/ocr-transformers';
+import { solveCaptcha } from '../lib/ppocr/inference';
 
 const BATCH_PREVIEW_KEY = 'local:batchPreview';
 const AUTH_HEADERS_KEY = 'local:authHeaders';
@@ -193,7 +195,7 @@ export default defineBackground(() => {
   });
 
   // Listen for sale time config updates from Options page
-  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === 'SALE_TIME_UPDATED') {
       saleTimeStore.set(msg.config)
         .then(() => rescheduleSaleAlarms('manual-confirm'))
@@ -204,7 +206,79 @@ export default defineBackground(() => {
         });
       return true;
     }
+    if (msg.type === 'SOLVE_CAPTCHA_REQUEST') {
+      handleSolveRequest(msg, sender).then(sendResponse).catch((e) => {
+        console.error('[bg] handleSolveRequest error:', e);
+        sendResponse({ error: e.message || String(e) });
+      });
+      return true;
+    }
   });
+
+  async function cropRegionToBlob(
+    fullImg: ImageBitmap, sx: number, sy: number, sw: number, sh: number
+  ): Promise<Blob> {
+    const c = new OffscreenCanvas(sw, sh);
+    const ctx = c.getContext('2d')!;
+    ctx.drawImage(fullImg, sx, sy, sw, sh, 0, 0, sw, sh);
+    return c.convertToBlob({ type: 'image/png' });
+  }
+
+  async function captureTabWithDebugger(tabId: number): Promise<string> {
+    return new Promise((resolve, reject) => {
+      chrome.debugger.attach({ tabId }, '1.3', () => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', { format: 'png' }, (result) => {
+          chrome.debugger.detach({ tabId });
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+            return;
+          }
+          resolve(`data:image/png;base64,${result.data}`);
+        });
+      });
+    });
+  }
+
+  async function handleSolveRequest(msg: any, sender: chrome.runtime.MessageSender) {
+    const tabId = sender.tab?.id;
+    const windowId = sender.tab?.windowId;
+    console.log('[bg] SOLVE_CAPTCHA_REQUEST from tab', tabId, 'window', windowId, 'dpr', msg.dpr);
+    if (!tabId || !windowId) return { error: 'No tab/window' };
+    if (!msg.iframeRect || !msg.promptChars) return { error: 'Missing params' };
+
+    const dpr = msg.dpr || 1;
+    const promptChars = msg.promptChars as string[];
+
+    // Take screenshot and crop to captcha region
+    const dataUrl = await captureTabWithDebugger(tabId);
+    const img = await fetch(dataUrl).then(r => r.blob()).then(b => createImageBitmap(b));
+    const sx = Math.max(0, Math.round(msg.iframeRect.x * dpr));
+    const sy = Math.max(0, Math.round(msg.iframeRect.y * dpr));
+    const sw = Math.min(Math.round(msg.iframeRect.w * dpr), img.width - sx);
+    const sh = Math.min(Math.round(msg.iframeRect.h * dpr), img.height - sy);
+    if (sw < 50 || sh < 50) return { error: 'Captcha region too small' };
+    const captchaBlob = await cropRegionToBlob(img, sx, sy, sw, sh);
+
+    const points = await solveCaptcha(captchaBlob, promptChars);
+    if (!points.length) return { error: 'No points returned from server' };
+
+    // Map normalized coords to page coords, with -6px Y offset
+    const ox = msg.iframeRect.x;
+    const oy = msg.iframeRect.y;
+    const Y_OFFSET = -28;
+    const pagePoints = points.map(p => ({
+      char: p.char,
+      pageX: Math.round(ox + p.nx * msg.iframeRect.w),
+      pageY: Math.round(oy + p.ny * msg.iframeRect.h + Y_OFFSET),
+    }));
+
+    console.log('[bg] solved', pagePoints.length, 'points via PP-OCR YOLO');
+    return { type: 'SOLVE_CAPTCHA_RESULT', points: pagePoints };
+  }
 
   // R1: Handle notification button clicks
   chrome.notifications.onButtonClicked.addListener((notifId, btnIdx) => {
