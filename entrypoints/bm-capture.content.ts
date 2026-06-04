@@ -747,7 +747,10 @@ export default defineContentScript({
           }
         },
         {
-          maxConcurrent: Math.max(initialCount, 3),
+          maxConcurrent: Math.min(Math.max(initialCount, 3), 4),
+          maxRetries: 6,
+          retryBackoffMs: 200,
+          retryBackoffFactor: 2,
           onShot: (result) => {
             postToOverlay({ type: 'FIRE_SHOT_RESULT', data: result });
           },
@@ -877,7 +880,10 @@ export default defineContentScript({
           }
         },
         {
-          maxConcurrent: 8,
+          maxConcurrent: 4,
+          maxRetries: 6,
+          retryBackoffMs: 200,
+          retryBackoffFactor: 2,
           onShot: (result) => {
             postToOverlay({ type: 'FIRE_SHOT_RESULT', data: result });
           },
