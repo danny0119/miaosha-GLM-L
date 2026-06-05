@@ -723,7 +723,7 @@ export default defineContentScript({
                 'bigmodel-organization': authHeaders.bigmodelOrganization,
                 'bigmodel-project': authHeaders.bigmodelProject,
               },
-              body: JSON.stringify({ productId: shot.productId, ticket: shot.ticket, randstr: shot.randstr }),
+              body: JSON.stringify({ productId: shot.productId, ticket: shot.ticket, randstr: shot.randstr, payType: 'BALANCE' }),
             });
             const body = await res.json();
             const rtt = Date.now() - t1;
@@ -737,6 +737,10 @@ export default defineContentScript({
             } else if (body.code === 555) {
               postToOverlay({ type: 'FIRE_RESULT', line: tag + ': server-busy-555 (' + rtt + 'ms)' });
               return { shotIdx, productId: shot.productId, outcome: 'busy' as const, code: 555, rtt, wave: shot.wave };
+            } else if (body.code === 500) {
+              const label = (body.msg || '').includes('验证码') ? 'captcha-validation-error' : 'server-error';
+              postToOverlay({ type: 'FIRE_RESULT', line: tag + ': ' + label + ' (' + rtt + 'ms)' });
+              return { shotIdx, productId: shot.productId, outcome: 'error' as const, code: 500, rtt, wave: shot.wave };
             } else {
               postToOverlay({ type: 'FIRE_RESULT', line: tag + ': code=' + body.code + ' ' + (body.msg || '') + ' (' + rtt + 'ms)' });
               return { shotIdx, productId: shot.productId, outcome: 'error' as const, code: body.code, rtt, wave: shot.wave };
@@ -775,10 +779,10 @@ export default defineContentScript({
       conductor.start();
     }
 
-    // ── Serial Fire: 1850ms interval, round-robin product assignment ──
-    // Single account 2s rate limit → serial 1850ms spacing
-    // 1 product selected → a-a-a-a (all tickets at same product)
-    // 2+ products selected → a-b-a-b (round-robin alternating)
+    // ── Burst Fire: sequential 50ms-interval launching ──
+    // startMs = absolute epoch ms when first shot should fire (pass Date.now() for immediate)
+    // API ground-truth: code=200+bizId+!soldOut → SUCCESS; code=555 → server busy (continue);
+    // code=500 → bad ticket (continue); code=200+soldOut → quota reached (continue)
     async function burstFire(startMs: number, authOverride?: any) {
       const { valid, selectedIds } = await getLaunchSnapshot();
       if (valid.length === 0) {
@@ -796,32 +800,33 @@ export default defineContentScript({
         return;
       }
 
-      const totalShots = valid.length;
-
-      // Build serial queue: round-robin product assignment
-      // 1 product → a-a-a; 2+ products → a-b-a-b
-      const queue: Array<{ ticket: string; randstr: string; productId: string }> = [];
-      for (let i = 0; i < totalShots; i++) {
-        queue.push({
-          ticket: valid[i].ticket,
-          randstr: valid[i].randstr,
-          productId: selectedIds[i % selectedIds.length],
+      const launchCount = Math.min(valid.length, selectedIds.length);
+      if (valid.length < selectedIds.length) {
+        postToOverlay({
+          type: 'FIRE_RESULT',
+          line: '> Ammo short: ' + valid.length + ' tickets for ' + selectedIds.length + ' selected products; only ' + launchCount + ' requests can be sent',
         });
       }
 
-      // Consume ALL tickets
-      await safeSet(TICKET_KEY, []);
-      postToOverlay({ type: 'TICKET_COUNT', count: 0, ttl: 0 });
-      try { chrome.runtime.sendMessage({ type: 'TICKET_POOL_UPDATED', count: 0 }); } catch {}
+      // Build flat queue: one ticket+randstr is consumed by one selected product.
+      // The number of requests is capped by the smaller of ticket count and selected product count.
+      const queue: Array<{ ticket: string; randstr: string; productId: string }> = [];
+      for (let i = 0; i < launchCount; i++) {
+        const ticket = valid[i];
+        queue.push({ ticket: ticket.ticket, randstr: ticket.randstr, productId: selectedIds[i] });
+      }
 
-      // Build display pattern
-      const pattern = selectedIds.length === 1
-        ? selectedIds[0].slice(-6)
-        : queue.map(q => q.productId.slice(-6)).join(' → ');
+      // Consume only the tickets used by this burst; preserve unused tickets for the next run.
+      await safeSet(TICKET_KEY, valid.slice(launchCount));
+      const remainingInfo = await getTicketInfo();
+      postToOverlay({ type: 'TICKET_COUNT', count: remainingInfo.count, ttl: remainingInfo.ttl });
+      try { chrome.runtime.sendMessage({ type: 'TICKET_POOL_UPDATED', count: remainingInfo.count }); } catch {}
+
+      const totalShots = queue.length;
 
       postToOverlay({
         type: 'FIRE_RESULT',
-        line: '> Serial: ' + totalShots + ' shots @ 1850ms (' + pattern + ')',
+        line: '> Burst: ' + totalShots + ' requests (adaptive concurrency)' + (remainingInfo.count > 0 ? ' (' + remainingInfo.count + ' tickets kept)' : ''),
       });
 
       postToOverlay({
@@ -833,62 +838,81 @@ export default defineContentScript({
         },
       });
 
-      const SERIAL_INTERVAL_MS = 1850;
+      const shots: FireShot[] = queue.map((item) => ({
+        ticket: item.ticket,
+        randstr: item.randstr,
+        productId: item.productId,
+        wave: 'burst',
+      }));
 
-      // Serial fire loop: one shot at a time, 1850ms apart
-      for (let i = 0; i < queue.length; i++) {
-        const item = queue[i];
-        const shotIdx = i;
-        const tag = '>[#' + (shotIdx + 1) + '/' + totalShots + '] ' + item.productId.slice(-6);
-
-        if (shotIdx > 0) {
-          await new Promise(r => setTimeout(r, SERIAL_INTERVAL_MS));
-        }
-
-        try {
+      const conductor = new FireConductor(
+        shots,
+        async (shot, shotIdx) => {
           const t1 = Date.now();
-          const res = await fetch('https://bigmodel.cn/api/biz/pay/preview', {
-            method: 'POST',
-            credentials: 'include',
-            headers: {
-              'content-type': 'application/json;charset=UTF-8',
-              'authorization': authHeaders.authorization,
-              'bigmodel-organization': authHeaders.bigmodelOrganization,
-              'bigmodel-project': authHeaders.bigmodelProject,
-            },
-            body: JSON.stringify({ productId: item.productId, ticket: item.ticket, randstr: item.randstr }),
-          });
-          const body = await res.json();
-          const rtt = Date.now() - t1;
+          const tag = '>[#' + (shotIdx + 1) + '/' + totalShots + '] ' + shot.productId.slice(-6);
+          try {
+            const res = await fetch('https://bigmodel.cn/api/biz/pay/preview', {
+              method: 'POST',
+              credentials: 'include',
+              headers: {
+                'content-type': 'application/json;charset=UTF-8',
+                'authorization': authHeaders.authorization,
+                'bigmodel-organization': authHeaders.bigmodelOrganization,
+                'bigmodel-project': authHeaders.bigmodelProject,
+              },
+              body: JSON.stringify({ productId: shot.productId, ticket: shot.ticket, randstr: shot.randstr, payType: 'BALANCE' }),
+            });
+            const body = await res.json();
+            const rtt = Date.now() - t1;
 
-          if (body.code === 200 && body.data && !body.data.soldOut && body.data.bizId) {
-            postToOverlay({ type: 'FIRE_RESULT', line: tag + ': ORDER bizId=' + body.data.bizId + ' (' + rtt + 'ms)' });
-            // Start payment polling
+            if (body.code === 200 && body.data && !body.data.soldOut && body.data.bizId) {
+              return { shotIdx, productId: shot.productId, outcome: 'success' as const, code: 200, rtt, bizId: body.data.bizId };
+            } else if (body.code === 200 && body.data?.soldOut) {
+              postToOverlay({ type: 'FIRE_RESULT', line: tag + ': sold-out today (' + rtt + 'ms)' });
+              return { shotIdx, productId: shot.productId, outcome: 'soldout' as const, code: 200, rtt };
+            } else if (body.code === 555) {
+              postToOverlay({ type: 'FIRE_RESULT', line: tag + ': server-busy-555 (' + rtt + 'ms)' });
+              return { shotIdx, productId: shot.productId, outcome: 'busy' as const, code: 555, rtt };
+            } else if (body.code === 500) {
+              const label = (body.msg || '').includes('验证码') ? 'captcha-validation-error' : 'server-error';
+              postToOverlay({ type: 'FIRE_RESULT', line: tag + ': ' + label + ' (' + rtt + 'ms)' });
+              return { shotIdx, productId: shot.productId, outcome: 'error' as const, code: 500, rtt };
+            } else {
+              postToOverlay({ type: 'FIRE_RESULT', line: tag + ': code=' + body.code + ' ' + (body.msg || '') + ' (' + rtt + 'ms)' });
+              return { shotIdx, productId: shot.productId, outcome: 'error' as const, code: body.code, rtt };
+            }
+          } catch (e: any) {
+            postToOverlay({ type: 'FIRE_RESULT', line: tag + ': net-err: ' + (e?.message || 'unknown') });
+            return { shotIdx, productId: shot.productId, outcome: 'neterr' as const, rtt: Math.round(Date.now() - t1) };
+          }
+        },
+        {
+          maxConcurrent: 4,
+          maxRetries: 6,
+          retryBackoffMs: 200,
+          retryBackoffFactor: 2,
+          onShot: (result) => {
+            postToOverlay({ type: 'FIRE_SHOT_RESULT', data: result });
+          },
+          onSuccess: async (result) => {
             const ps = {
-              bizId: body.data.bizId as string,
+              bizId: result.bizId as string,
               amount: 0,
-              productId: item.productId,
+              productId: result.productId,
               status: 'pending' as const,
               updatedAt: Date.now(),
             };
             await safeSet('local:paymentState', ps);
             postToOverlay({ type: 'BURST_FIRE_SUCCESS', data: ps });
-            return;
-          } else if (body.code === 200 && body.data?.soldOut) {
-            postToOverlay({ type: 'FIRE_RESULT', line: tag + ': sold-out today (' + rtt + 'ms)' });
-          } else if (body.code === 555) {
-            postToOverlay({ type: 'FIRE_RESULT', line: tag + ': server-busy-555 (' + rtt + 'ms)' });
-          } else {
-            postToOverlay({ type: 'FIRE_RESULT', line: tag + ': code=' + body.code + ' ' + (body.msg || '') + ' (' + rtt + 'ms)' });
-          }
-        } catch (e: any) {
-          postToOverlay({ type: 'FIRE_RESULT', line: tag + ': net-err: ' + (e?.message || 'unknown') });
-        }
-      }
+          },
+          onDepleted: () => {
+            postToOverlay({ type: 'FIRE_RESULT', line: '> Burst complete — ammo depleted (' + totalShots + ' shots)' });
+            postToOverlay({ type: 'BURST_FIRE_DEPLETED', data: { total: totalShots } });
+          },
+        },
+      );
 
-      // All shots exhausted without success
-      postToOverlay({ type: 'FIRE_RESULT', line: '> Serial complete — all ammo expended (' + totalShots + ' shots)' });
-      postToOverlay({ type: 'BURST_FIRE_DEPLETED', data: { total: totalShots } });
+      conductor.start();
     }
 
     async function prefireAndBurst(startMs: number, reason: string) {
@@ -1005,7 +1029,8 @@ export default defineContentScript({
 
       // ── Captcha ticket produced ──
       if (type === 'CAPTCHA_PRODUCED' && payload?.ticket) {
-        const pool: any[] = (await safeGet<any[]>(TICKET_KEY)) ?? [];
+        let pool: any[] = (await safeGet<any[]>(TICKET_KEY)) ?? [];
+        pool = pool.filter((t: any) => t.createdAt && (Date.now() - t.createdAt) < 120000);
         if (!pool.some((t: any) => t.ticket === payload.ticket)) {
           pool.push({ ticket: payload.ticket, randstr: payload.randstr, createdAt: Date.now() });
           await safeSet(TICKET_KEY, pool);
@@ -1020,6 +1045,13 @@ export default defineContentScript({
       if (type === 'CAPTCHA_ERROR' && payload) {
         postToOverlay({ type: 'FIRE_RESULT', line: '> Captcha error: ' + payload.msg });
         try { chrome.runtime.sendMessage({ type: 'CAPTCHA_ERROR', msg: payload.msg }); } catch {}
+      }
+
+      // ── Clear ticket pool ──
+      if (type === 'CLEAR_TICKET_POOL') {
+        await safeSet(TICKET_KEY, []);
+        postToOverlay({ type: 'TICKET_COUNT', count: 0, ttl: 0 });
+        try { chrome.runtime.sendMessage({ type: 'TICKET_POOL_UPDATED', count: 0 }); } catch {}
       }
 
       // ── Batch mode status → full-width force-stop banner ──

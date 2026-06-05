@@ -7,6 +7,7 @@ var BATCH_SESSION_LIMIT = 50; // auto-stop after this many per session (default 
 var _replenishEnabled = false; // auto-replenish mode: auto-solve each batch captcha
 var _replenishTarget = 30; // ticket count target for auto-replenish
 var _authFailed = false; // true when batch-preview API returns code=1001 (not logged in)
+window.__TICKET_POOL__ = []; // exposed to page console for debugging
 
 // ── Runtime state (latency calibration + auto-fire scheduler) ──
 var _rt = {
@@ -95,3 +96,11 @@ var _selectedProducts = {};
 var _ticketCount = 0;
 var _planOrder = ['Lite', 'Pro', 'Max'];
 var SELECTION_VERSION_KEY = 'bm_selected_products_v2';
+
+// ── Keep window.__TICKET_POOL__ in sync with chrome.storage ──
+window.addEventListener('message', function(ev) {
+  if (ev.source !== window || !ev.data || !ev.data.__miaosha_cmd) return;
+  if (ev.data.type === 'TICKET_POOL_SYNC' && Array.isArray(ev.data.data)) {
+    window.__TICKET_POOL__ = ev.data.data;
+  }
+});

@@ -17,6 +17,7 @@
     replenishStore,
     type ReplenishConfig,
   } from '../../lib/settings/replenish';
+  import HubSection from './HubSection.svelte';
 
   let mode = $state<DevMode>('development');
   let loaded = $state(false);
@@ -478,6 +479,8 @@
       </div>
     {/if}
   </section>
+
+  <HubSection />
 </div>
 
 <style>

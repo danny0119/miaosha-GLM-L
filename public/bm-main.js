@@ -150,6 +150,7 @@ var BATCH_SESSION_LIMIT = 50; // auto-stop after this many per session (default 
 var _replenishEnabled = false; // auto-replenish mode: auto-solve each batch captcha
 var _replenishTarget = 30; // ticket count target for auto-replenish
 var _authFailed = false; // true when batch-preview API returns code=1001 (not logged in)
+window.__TICKET_POOL__ = []; // exposed to page console for debugging
 
 // ── Runtime state (latency calibration + auto-fire scheduler) ──
 var _rt = {
@@ -239,6 +240,14 @@ var _ticketCount = 0;
 var _planOrder = ['Lite', 'Pro', 'Max'];
 var SELECTION_VERSION_KEY = 'bm_selected_products_v2';
 
+// ── Keep window.__TICKET_POOL__ in sync with chrome.storage ──
+window.addEventListener('message', function(ev) {
+  if (ev.source !== window || !ev.data || !ev.data.__miaosha_cmd) return;
+  if (ev.data.type === 'TICKET_POOL_SYNC' && Array.isArray(ev.data.data)) {
+    window.__TICKET_POOL__ = ev.data.data;
+  }
+});
+
 
 // ── 03-xhr.js ──
 function setupXhrInterception() {
@@ -283,13 +292,33 @@ function setupXhrInterception() {
 
 
 // ── 04-captcha.js ──
+var TICKET_TTL = 120000; // 120s, Tencent captcha tickets expire ~2min
+
+function pruneTicketPool() {
+  var now = Date.now();
+  window.__TICKET_POOL__ = (window.__TICKET_POOL__ || []).filter(function(t) {
+    return t.createdAt && (now - t.createdAt) < TICKET_TTL;
+  });
+}
+
+window.clearTicketPool = function() {
+  window.__TICKET_POOL__ = [];
+  postMsg('CLEAR_TICKET_POOL', {});
+  console.log('[miaosha] Pool cleared (window + storage)');
+};
+
 function produceCaptcha() {
   if (typeof window.TencentCaptcha === 'undefined') { postMsg('CAPTCHA_ERROR', { msg: 'SDK not loaded' }); return; }
   try {
     var c = new window.TencentCaptcha(CAPTCHA_APPID, function(res) {
       _activeCaptcha = null;
+      var now = new Date().toISOString().slice(11, 23);
       if (res.ret === 0 && res.ticket) {
-        postMsg('CAPTCHA_PRODUCED', { ticket: res.ticket, randstr: res.randstr });
+        console.log('[555-diag] ' + now + ' cap_union SUCCESS ret=0 ticket=' + (res.ticket || '').slice(0, 20) + '...');
+        var _ticket = { ticket: res.ticket, randstr: res.randstr, createdAt: Date.now() };
+        pruneTicketPool();
+        window.__TICKET_POOL__.push(_ticket);
+        postMsg('CAPTCHA_PRODUCED', _ticket);
         // Batch mode: count and auto-stop at session limit
         if (_batchMode) {
           _batchCount++;
@@ -301,6 +330,7 @@ function produceCaptcha() {
         }
       }
       else {
+        console.log('[555-diag] ' + now + ' cap_union FAILED ret=' + res.ret + ' errMsg=' + (res.msg || '') + ' ticket=' + (res.ticket || 'none'));
         postMsg('CAPTCHA_ERROR', { msg: 'Failed (ret=' + res.ret + ')' });
         if (_batchMode) { setTimeout(produceCaptcha, 500); }
       }
@@ -314,7 +344,10 @@ function produceCaptcha() {
     } else {
       console.log('[miaosha] Auto-replenish skipped: batchMode=' + _batchMode + ' replenishEnabled=' + _replenishEnabled);
     }
-  } catch(e) { postMsg('CAPTCHA_ERROR', { msg: e.message }); }
+  } catch(e) {
+    console.log('[555-diag] ' + new Date().toISOString().slice(11, 23) + ' captcha EXCEPTION: ' + e.message);
+    postMsg('CAPTCHA_ERROR', { msg: e.message });
+  }
 }
 
 // Force-destroy the currently active captcha modal (for ESC / force-stop)
@@ -874,7 +907,20 @@ function buildHTML() {
     '<div class="lg" id="_log"></div>' +
     '</div>' +
 
-    // Card 4: Runtime
+    // Card 4: Hub (multi-account)
+    '<div class="c" id="_hubCard">' +
+    '<div class="ch"><span class="ct">&#128101; Hub</span><span class="tg tg-b" id="_hubTag">OFF</span></div>' +
+    '<div id="_hubBody" style="display:none">' +
+    '<div class="hub-status" style="display:flex;gap:12px;justify-content:center;padding:6px 0 10px;font-size:8px;color:#94a3b8">' +
+      '<span>Accounts: <strong id="_hubAcctCount" style="color:#64748b">0</strong></span>' +
+      '<span>Authed: <strong id="_hubAuthedCount" style="color:#10b981">0</strong></span>' +
+    '</div>' +
+    '<div id="_hubAcctList" style="font-size:7px;margin-bottom:8px"></div>' +
+    '<button class="fb" id="_hfb" disabled>&#128101; HUB FIRE (0)</button>' +
+    '</div>' +
+    '</div>' +
+
+    // Card 5: Runtime
     '<div class="c">' +
     '<div class="ch"><span class="ct">&#9201; Runtime</span><span class="tg tg-g">LIVE</span></div>' +
     '<div class="rr"><div class="rb"><div class="rv" style="color:#06b6d4" id="_lat">--<span style="font-size:9px;color:#94a3b8">ms</span></div><div class="rl">Latency</div></div>' +
@@ -1022,6 +1068,43 @@ function injectOverlay() {
       if (autoElD) autoElD.textContent = 'Depleted (' + (d.data && d.data.total || 0) + ' shots)';
     }
 
+    // Hub status
+    if (d.type === 'HUB_STATUS') {
+      var hubData = d.data;
+      var hubTag = document.getElementById('_hubTag');
+      var hubBody = document.getElementById('_hubBody');
+      var hubAcctCount = document.getElementById('_hubAcctCount');
+      var hubAuthedCount = document.getElementById('_hubAuthedCount');
+      var hubAcctList = document.getElementById('_hubAcctList');
+      var hfb = document.getElementById('_hfb');
+
+      if (hubTag) hubTag.textContent = hubData.enabled ? 'ON' : 'OFF';
+      if (hubTag) hubTag.className = 'tg ' + (hubData.enabled ? 'tg-g' : 'tg-b');
+      if (hubBody) hubBody.style.display = hubData.enabled ? 'block' : 'none';
+
+      var accts = hubData.accounts || [];
+      var authed = accts.filter(function(a) { return a.authed; });
+      if (hubAcctCount) hubAcctCount.textContent = accts.length;
+      if (hubAuthedCount) hubAuthedCount.textContent = authed.length;
+
+      if (hubAcctList) {
+        var html = '';
+        for (var hi = 0; hi < accts.length; hi++) {
+          var a = accts[hi];
+          html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 6px;border-bottom:1px solid rgba(148,163,184,0.12);font-size:7px">' +
+            '<span style="font-weight:600;color:#334155">' + a.username.replace(/[<>&"']/g,function(c){return '&#'+c.charCodeAt(0)+';'}) + '</span>' +
+            '<span style="color:' + (a.authed ? '#10b981' : '#94a3b8') + ';font-weight:700">' + (a.authed ? 'AUTHED' : 'NO AUTH') + '</span>' +
+            '</div>';
+        }
+        hubAcctList.innerHTML = html;
+      }
+
+      if (hfb) {
+        hfb.disabled = !hubData.enabled || authed.length === 0;
+        hfb.textContent = '👥 HUB FIRE (' + authed.length + ')';
+      }
+    }
+
     // Prefire gate status (auth/ticket hard-stop reasons)
     if (d.type === 'PREFIRE_STATUS') {
       renderPrefireAuthStatus(d.data);
@@ -1069,6 +1152,11 @@ function injectOverlay() {
   document.getElementById('_fb').addEventListener('click', function() {
     window.postMessage({ __miaosha_cmd: true, type: 'PREFIRE_FIRE', data: { startMs: Date.now(), reason: 'manual' } }, '*');
     var lg = document.getElementById('_log'); if (lg) lg.innerHTML += '> Manual prefire + fire…<br>';
+  });
+  var hfbBtn = document.getElementById('_hfb');
+  if (hfbBtn) hfbBtn.addEventListener('click', function() {
+    window.postMessage({ __miaosha_cmd: true, type: 'HUB_FIRE', data: { startMs: Date.now() } }, '*');
+    var lg = document.getElementById('_log'); if (lg) lg.innerHTML += '> Hub fire triggered…<br>';
   });
 
   // Minimize
@@ -1140,6 +1228,10 @@ function injectOverlay() {
 
   // Initial state poll
   setTimeout(poll, 200);
+  // Poll hub status every 5 seconds
+  function pollHub() { cmdToOverlay('GET_HUB_STATUS'); }
+  setInterval(pollHub, 5000);
+  setTimeout(pollHub, 600);
   // Request sale time from isolated world (schedules auto-fire after response)
   setTimeout(function() { cmdToOverlay('GET_SALE_TIME'); }, 800);
   // Request latest runtime calibration snapshot (latency + clock offset)

@@ -52,7 +52,20 @@ function buildHTML() {
     '<div class="lg" id="_log"></div>' +
     '</div>' +
 
-    // Card 4: Runtime
+    // Card 4: Hub (multi-account)
+    '<div class="c" id="_hubCard">' +
+    '<div class="ch"><span class="ct">&#128101; Hub</span><span class="tg tg-b" id="_hubTag">OFF</span></div>' +
+    '<div id="_hubBody" style="display:none">' +
+    '<div class="hub-status" style="display:flex;gap:12px;justify-content:center;padding:6px 0 10px;font-size:8px;color:#94a3b8">' +
+      '<span>Accounts: <strong id="_hubAcctCount" style="color:#64748b">0</strong></span>' +
+      '<span>Authed: <strong id="_hubAuthedCount" style="color:#10b981">0</strong></span>' +
+    '</div>' +
+    '<div id="_hubAcctList" style="font-size:7px;margin-bottom:8px"></div>' +
+    '<button class="fb" id="_hfb" disabled>&#128101; HUB FIRE (0)</button>' +
+    '</div>' +
+    '</div>' +
+
+    // Card 5: Runtime
     '<div class="c">' +
     '<div class="ch"><span class="ct">&#9201; Runtime</span><span class="tg tg-g">LIVE</span></div>' +
     '<div class="rr"><div class="rb"><div class="rv" style="color:#06b6d4" id="_lat">--<span style="font-size:9px;color:#94a3b8">ms</span></div><div class="rl">Latency</div></div>' +
@@ -200,6 +213,43 @@ function injectOverlay() {
       if (autoElD) autoElD.textContent = 'Depleted (' + (d.data && d.data.total || 0) + ' shots)';
     }
 
+    // Hub status
+    if (d.type === 'HUB_STATUS') {
+      var hubData = d.data;
+      var hubTag = document.getElementById('_hubTag');
+      var hubBody = document.getElementById('_hubBody');
+      var hubAcctCount = document.getElementById('_hubAcctCount');
+      var hubAuthedCount = document.getElementById('_hubAuthedCount');
+      var hubAcctList = document.getElementById('_hubAcctList');
+      var hfb = document.getElementById('_hfb');
+
+      if (hubTag) hubTag.textContent = hubData.enabled ? 'ON' : 'OFF';
+      if (hubTag) hubTag.className = 'tg ' + (hubData.enabled ? 'tg-g' : 'tg-b');
+      if (hubBody) hubBody.style.display = hubData.enabled ? 'block' : 'none';
+
+      var accts = hubData.accounts || [];
+      var authed = accts.filter(function(a) { return a.authed; });
+      if (hubAcctCount) hubAcctCount.textContent = accts.length;
+      if (hubAuthedCount) hubAuthedCount.textContent = authed.length;
+
+      if (hubAcctList) {
+        var html = '';
+        for (var hi = 0; hi < accts.length; hi++) {
+          var a = accts[hi];
+          html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 6px;border-bottom:1px solid rgba(148,163,184,0.12);font-size:7px">' +
+            '<span style="font-weight:600;color:#334155">' + a.username.replace(/[<>&"']/g,function(c){return '&#'+c.charCodeAt(0)+';'}) + '</span>' +
+            '<span style="color:' + (a.authed ? '#10b981' : '#94a3b8') + ';font-weight:700">' + (a.authed ? 'AUTHED' : 'NO AUTH') + '</span>' +
+            '</div>';
+        }
+        hubAcctList.innerHTML = html;
+      }
+
+      if (hfb) {
+        hfb.disabled = !hubData.enabled || authed.length === 0;
+        hfb.textContent = '👥 HUB FIRE (' + authed.length + ')';
+      }
+    }
+
     // Prefire gate status (auth/ticket hard-stop reasons)
     if (d.type === 'PREFIRE_STATUS') {
       renderPrefireAuthStatus(d.data);
@@ -247,6 +297,11 @@ function injectOverlay() {
   document.getElementById('_fb').addEventListener('click', function() {
     window.postMessage({ __miaosha_cmd: true, type: 'PREFIRE_FIRE', data: { startMs: Date.now(), reason: 'manual' } }, '*');
     var lg = document.getElementById('_log'); if (lg) lg.innerHTML += '> Manual prefire + fire…<br>';
+  });
+  var hfbBtn = document.getElementById('_hfb');
+  if (hfbBtn) hfbBtn.addEventListener('click', function() {
+    window.postMessage({ __miaosha_cmd: true, type: 'HUB_FIRE', data: { startMs: Date.now() } }, '*');
+    var lg = document.getElementById('_log'); if (lg) lg.innerHTML += '> Hub fire triggered…<br>';
   });
 
   // Minimize
@@ -318,6 +373,10 @@ function injectOverlay() {
 
   // Initial state poll
   setTimeout(poll, 200);
+  // Poll hub status every 5 seconds
+  function pollHub() { cmdToOverlay('GET_HUB_STATUS'); }
+  setInterval(pollHub, 5000);
+  setTimeout(pollHub, 600);
   // Request sale time from isolated world (schedules auto-fire after response)
   setTimeout(function() { cmdToOverlay('GET_SALE_TIME'); }, 800);
   // Request latest runtime calibration snapshot (latency + clock offset)

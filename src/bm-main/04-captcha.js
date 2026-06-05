@@ -1,10 +1,30 @@
+var TICKET_TTL = 120000; // 120s, Tencent captcha tickets expire ~2min
+
+function pruneTicketPool() {
+  var now = Date.now();
+  window.__TICKET_POOL__ = (window.__TICKET_POOL__ || []).filter(function(t) {
+    return t.createdAt && (now - t.createdAt) < TICKET_TTL;
+  });
+}
+
+window.clearTicketPool = function() {
+  window.__TICKET_POOL__ = [];
+  postMsg('CLEAR_TICKET_POOL', {});
+  console.log('[miaosha] Pool cleared (window + storage)');
+};
+
 function produceCaptcha() {
   if (typeof window.TencentCaptcha === 'undefined') { postMsg('CAPTCHA_ERROR', { msg: 'SDK not loaded' }); return; }
   try {
     var c = new window.TencentCaptcha(CAPTCHA_APPID, function(res) {
       _activeCaptcha = null;
+      var now = new Date().toISOString().slice(11, 23);
       if (res.ret === 0 && res.ticket) {
-        postMsg('CAPTCHA_PRODUCED', { ticket: res.ticket, randstr: res.randstr });
+        console.log('[555-diag] ' + now + ' cap_union SUCCESS ret=0 ticket=' + (res.ticket || '').slice(0, 20) + '...');
+        var _ticket = { ticket: res.ticket, randstr: res.randstr, createdAt: Date.now() };
+        pruneTicketPool();
+        window.__TICKET_POOL__.push(_ticket);
+        postMsg('CAPTCHA_PRODUCED', _ticket);
         // Batch mode: count and auto-stop at session limit
         if (_batchMode) {
           _batchCount++;
@@ -16,6 +36,7 @@ function produceCaptcha() {
         }
       }
       else {
+        console.log('[555-diag] ' + now + ' cap_union FAILED ret=' + res.ret + ' errMsg=' + (res.msg || '') + ' ticket=' + (res.ticket || 'none'));
         postMsg('CAPTCHA_ERROR', { msg: 'Failed (ret=' + res.ret + ')' });
         if (_batchMode) { setTimeout(produceCaptcha, 500); }
       }
@@ -29,7 +50,10 @@ function produceCaptcha() {
     } else {
       console.log('[miaosha] Auto-replenish skipped: batchMode=' + _batchMode + ' replenishEnabled=' + _replenishEnabled);
     }
-  } catch(e) { postMsg('CAPTCHA_ERROR', { msg: e.message }); }
+  } catch(e) {
+    console.log('[555-diag] ' + new Date().toISOString().slice(11, 23) + ' captcha EXCEPTION: ' + e.message);
+    postMsg('CAPTCHA_ERROR', { msg: e.message });
+  }
 }
 
 // Force-destroy the currently active captcha modal (for ESC / force-stop)
