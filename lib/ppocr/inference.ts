@@ -1,5 +1,6 @@
 const OCR_TIMEOUT = 30000;
 const SOLVE_URL = 'http://localhost:8888/solve_captcha';
+const DIRECT_URL = 'http://localhost:8888/captcha_direct_url';
 const HEALTH_URL = 'http://localhost:8888/health';
 
 function blobToBase64(blob: Blob): Promise<string> {
@@ -41,6 +42,23 @@ export async function solveCaptchaBase64(
 ): Promise<ClickPoint[]> {
   const body = JSON.stringify({ image: imageBase64, prompt_chars: promptChars });
   const res = await fetch(SOLVE_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+    signal: AbortSignal.timeout(OCR_TIMEOUT),
+  });
+  if (!res.ok) throw new Error(`PP-OCR server error ${res.status}`);
+  const data = await res.json();
+  if (data?.error) throw new Error(data.error);
+  return (data?.points as ClickPoint[]) ?? [];
+}
+
+export async function solveCaptchaFromUrl(
+  imageUrl: string,
+  promptChars: string[]
+): Promise<ClickPoint[]> {
+  const body = JSON.stringify({ image_url: imageUrl, prompt_chars: promptChars });
+  const res = await fetch(DIRECT_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body,

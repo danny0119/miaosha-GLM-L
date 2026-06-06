@@ -1861,11 +1861,48 @@ function waitForCaptcha(timeoutMs) {
       if (Date.now() - start > timeoutMs) { resolve(null); return; }
       setTimeout(check, 200);
     }
-    setTimeout(check, 500);
+    check();
   });
 }
 
 // Called from 04-captcha.js produceCaptcha() when _batchMode && _replenishEnabled
+function waitForCaptchaBgUrl(timeoutMs) {
+  return new Promise(function(resolve) {
+    var start = Date.now();
+    function poll() {
+      // Scan all children for background-image with a real HTTP url
+      var content = document.querySelector('.tencent-captcha-dy__content');
+      if (content) {
+        var all = content.querySelectorAll('*');
+        for (var i = 0; i < all.length; i++) {
+          var el = all[i];
+          var bg = el.style && el.style.backgroundImage;
+          if (!bg || bg === 'none') {
+            bg = window.getComputedStyle(el).backgroundImage;
+          }
+          if (bg && bg !== 'none') {
+            var m = bg.match(/url\(["']?(https?:\/\/[^"')]+)/);
+            if (m) {
+              var url = m[1];
+              try { url = new URL(url, location.href).href; } catch(e) {}
+              console.log('[miaosha] bgUrl found (bg-img) after ' + (Date.now() - start) + 'ms');
+              resolve(url);
+              return;
+            }
+          }
+        }
+      }
+      var elapsed = Date.now() - start;
+      if (elapsed >= timeoutMs) {
+        resolve(null);
+        return;
+      }
+      setTimeout(poll, 50);
+    }
+    poll();
+  });
+}
+
 function autoSolveCurrentCaptcha() {
   console.log('[miaosha] auto-solve started');
   waitForCaptcha(12000).then(function(container) {
@@ -1875,27 +1912,20 @@ function autoSolveCurrentCaptcha() {
       if (lg) lg.innerHTML += '> Auto-replenish: captcha not found<br>';
       return;
     }
-    console.log('[miaosha] captcha container found');
-    setTimeout(function() {
-      if (!_batchMode || !_replenishEnabled) return;
-      var promptChars = readPromptText();
-      if (!promptChars || promptChars.length < 3) {
-        console.log('[miaosha] prompt chars not found');
-        return;
-      }
-      console.log('[miaosha] prompt=' + promptChars.join(','));
-      var bestRect = getBestCaptchaRect();
-      if (!bestRect) {
-        console.log('[miaosha] captcha rect not found');
-        return;
-      }
-      console.log('[miaosha] bestRect=' + JSON.stringify(bestRect));
-      // Send to ISOLATED world for OCR via screenshot
-      postMsg('AUTO_REPLENISH_MODAL_OPEN', {
-        iframeRect: bestRect,
-        promptChars: promptChars,
-      });
-    }, 1000);
+    console.log('[miaosha] captcha container found, tag=' + container.tagName + ' class=' + (container.className || ''));
+    var promptChars = readPromptText();
+    if (!promptChars || promptChars.length < 3) {
+      console.log('[miaosha] prompt chars not found');
+      return;
+    }
+    console.log('[miaosha] prompt=' + promptChars.join(','));
+    // Screenshot path (bgUrl not available in this captcha version)
+    var bestRect = getBestCaptchaRect();
+    if (!bestRect) { console.log('[miaosha] captcha rect not found'); return; }
+    postMsg('AUTO_REPLENISH_MODAL_OPEN', {
+      iframeRect: bestRect,
+      promptChars: promptChars,
+    });
   });
 }
 

@@ -9,7 +9,7 @@ import {
   saleTimeStore,
 } from '../lib/settings/sale-time';
 import { recognizeChars as recognizeCharsTrOCR } from '../lib/vision/ocr-transformers';
-import { solveCaptcha } from '../lib/ppocr/inference';
+import { solveCaptcha, solveCaptchaFromUrl } from '../lib/ppocr/inference';
 
 const BATCH_PREVIEW_KEY = 'local:batchPreview';
 const AUTH_HEADERS_KEY = 'local:authHeaders';
@@ -213,25 +213,25 @@ export default defineBackground(() => {
       });
       return true;
     }
+    if (msg.type === 'SOLVE_CAPTCHA_DIRECT_URL_REQUEST') {
+      handleSolveDirectUrlRequest(msg).then(sendResponse).catch((e) => {
+        console.error('[bg] handleSolveDirectUrlRequest error:', e);
+        sendResponse({ error: e.message || String(e) });
+      });
+      return true;
+    }
   });
 
-  async function cropRegionToBlob(
-    fullImg: ImageBitmap, sx: number, sy: number, sw: number, sh: number
-  ): Promise<Blob> {
-    const c = new OffscreenCanvas(sw, sh);
-    const ctx = c.getContext('2d')!;
-    ctx.drawImage(fullImg, sx, sy, sw, sh, 0, 0, sw, sh);
-    return c.convertToBlob({ type: 'image/png' });
-  }
-
-  async function captureTabWithDebugger(tabId: number): Promise<string> {
+  async function captureTabWithDebugger(tabId: number, clip?: { x: number; y: number; width: number; height: number; scale: number }): Promise<string> {
     return new Promise((resolve, reject) => {
       chrome.debugger.attach({ tabId }, '1.3', () => {
         if (chrome.runtime.lastError) {
           reject(new Error(chrome.runtime.lastError.message));
           return;
         }
-        chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', { format: 'png' }, (result) => {
+        const params: any = { format: 'png' };
+        if (clip) params.clip = clip;
+        chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', params, (result) => {
           chrome.debugger.detach({ tabId });
           if (chrome.runtime.lastError) {
             reject(new Error(chrome.runtime.lastError.message));
@@ -252,32 +252,53 @@ export default defineBackground(() => {
 
     const dpr = msg.dpr || 1;
     const promptChars = msg.promptChars as string[];
+    const rect = msg.iframeRect;
 
-    // Take screenshot and crop to captcha region
-    const dataUrl = await captureTabWithDebugger(tabId);
-    const img = await fetch(dataUrl).then(r => r.blob()).then(b => createImageBitmap(b));
-    const sx = Math.max(0, Math.round(msg.iframeRect.x * dpr));
-    const sy = Math.max(0, Math.round(msg.iframeRect.y * dpr));
-    const sw = Math.min(Math.round(msg.iframeRect.w * dpr), img.width - sx);
-    const sh = Math.min(Math.round(msg.iframeRect.h * dpr), img.height - sy);
-    if (sw < 50 || sh < 50) return { error: 'Captcha region too small' };
-    const captchaBlob = await cropRegionToBlob(img, sx, sy, sw, sh);
+    // Capture only the captcha region via debugger clip (no full-page screenshot)
+    const dataUrl = await captureTabWithDebugger(tabId, {
+      x: rect.x, y: rect.y, width: rect.w, height: rect.h, scale: dpr,
+    });
+    const captchaBlob = await (await fetch(dataUrl)).blob();
 
     const points = await solveCaptcha(captchaBlob, promptChars);
     if (!points.length) return { error: 'No points returned from server' };
 
-    // Map normalized coords to page coords, with -6px Y offset
+    // Map normalized coords to page coords
     const ox = msg.iframeRect.x;
     const oy = msg.iframeRect.y;
-    const Y_OFFSET = -28;
     const pagePoints = points.map(p => ({
       char: p.char,
       pageX: Math.round(ox + p.nx * msg.iframeRect.w),
-      pageY: Math.round(oy + p.ny * msg.iframeRect.h + Y_OFFSET),
+      pageY: Math.round(oy + p.ny * msg.iframeRect.h),
     }));
 
     console.log('[bg] solved', pagePoints.length, 'points via PP-OCR YOLO');
     return { type: 'SOLVE_CAPTCHA_RESULT', points: pagePoints };
+  }
+
+  async function handleSolveDirectUrlRequest(msg: any) {
+    const imageUrl = msg.imageUrl as string;
+    const promptChars = msg.promptChars as string[];
+    const iframeRect = msg.iframeRect as { x: number; y: number; w: number; h: number } | undefined;
+    console.log('[bg] SOLVE_CAPTCHA_DIRECT_URL_REQUEST url=' + (imageUrl || '').slice(0, 80));
+    if (!imageUrl || !promptChars?.length) return { error: 'Missing params' };
+
+    const points = await solveCaptchaFromUrl(imageUrl, promptChars);
+    if (!points.length) return { error: 'No points returned from server' };
+
+    // Map normalized coords to page coords if rect available
+    if (iframeRect) {
+      const pagePoints = points.map(p => ({
+        char: p.char,
+        pageX: Math.round(iframeRect.x + p.nx * iframeRect.w),
+        pageY: Math.round(iframeRect.y + p.ny * iframeRect.h),
+      }));
+      console.log('[bg] direct-url solved', pagePoints.length, 'points');
+      return { type: 'SOLVE_CAPTCHA_RESULT', points: pagePoints };
+    }
+
+    console.log('[bg] direct-url solved', points.length, 'points (normalized)');
+    return { points };
   }
 
   // R1: Handle notification button clicks

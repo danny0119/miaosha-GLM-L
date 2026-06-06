@@ -1030,7 +1030,7 @@ export default defineContentScript({
       // ── Captcha ticket produced ──
       if (type === 'CAPTCHA_PRODUCED' && payload?.ticket) {
         let pool: any[] = (await safeGet<any[]>(TICKET_KEY)) ?? [];
-        pool = pool.filter((t: any) => t.createdAt && (Date.now() - t.createdAt) < 120000);
+        pool = pool.filter((t: any) => t.createdAt && (Date.now() - t.createdAt) < TICKET_TTL_MS);
         if (!pool.some((t: any) => t.ticket === payload.ticket)) {
           pool.push({ ticket: payload.ticket, randstr: payload.randstr, createdAt: Date.now() });
           await safeSet(TICKET_KEY, pool);
@@ -1065,8 +1065,39 @@ export default defineContentScript({
 
       // ── Auto-replenish: captcha modal detected, start solving ──
       if (type === 'AUTO_REPLENISH_MODAL_OPEN' && payload) {
+        const bgUrl = payload.bgUrl as string | undefined;
         const iframeRect = payload.iframeRect;
         const promptChars: string[] | null = payload.promptChars;
+
+        // Prefer bgUrl direct path (no screenshot)
+        if (bgUrl && promptChars && promptChars.length >= 3) {
+          console.log('[capture] SOLVE_CAPTCHA_DIRECT_URL_REQUEST bgUrl=' + bgUrl.slice(0, 80));
+          try {
+            const response = await chrome.runtime.sendMessage({
+              type: 'SOLVE_CAPTCHA_DIRECT_URL_REQUEST',
+              imageUrl: bgUrl,
+              promptChars,
+              iframeRect,
+            });
+            if (response?.points?.length > 0) {
+              window.postMessage({
+                __miaosha_cmd: true,
+                type: 'CAPTCHA_CLICK',
+                data: { points: response.points },
+              }, '*');
+            } else {
+              const errMsg = response?.error || 'empty points';
+              console.error('[capture] direct-url solve failed:', errMsg);
+              postToOverlay({ type: 'FIRE_RESULT', line: '> Auto-replenish: direct-url solve failed: ' + errMsg });
+            }
+          } catch (e: any) {
+            console.error('[capture] direct-url solve error:', e);
+            postToOverlay({ type: 'FIRE_RESULT', line: '> Auto-replenish: direct-url solve error: ' + (e?.message || 'unknown') });
+          }
+          return;
+        }
+
+        // Fallback: screenshot path
         if (iframeRect && promptChars && promptChars.length >= 3) {
           const dpr = window.devicePixelRatio || 1;
           console.log('[capture] SOLVE_CAPTCHA_REQUEST sending', { iframeRect, promptChars, dpr });
